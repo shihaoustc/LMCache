@@ -296,3 +296,71 @@ def test_turboquant_storage_manager_roundtrip() -> None:
         )
     finally:
         sm.close()
+
+
+# =============================================================================
+# GPU direct test: TurboQuantSerializer + TurboQuantDeserializer
+# =============================================================================
+
+
+class _FakeMemoryObj:
+    def __init__(self, tensor: torch.Tensor):
+        self.tensor = tensor
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_turboquant_direct_roundtrip_cuda() -> None:
+    """Direct GPU round-trip through TurboQuant serializer/deserializer."""
+    from lmcache.v1.distributed.serde.turboquant import TurboQuantDeserializer
+
+    device = torch.device("cuda:0")
+    dtype = torch.bfloat16
+
+    # LMCache KV layout: [2, num_layers, num_tokens, hidden_dim]
+    num_layers = 4
+    num_tokens = 128
+    num_heads = 8
+    head_dim = 128
+    hidden_dim = num_heads * head_dim
+
+    cfg = TurboQuantSerdeConfig(
+        preset="turboquant_k8v4",
+        head_dim=head_dim,
+        block_size=16,
+    )
+
+    shape = torch.Size([2, num_layers, num_tokens, hidden_dim])
+    original = torch.randn(shape, dtype=dtype, device=device)
+
+    serializer = TurboQuantSerializer(cfg)
+    deserializer = TurboQuantDeserializer(cfg)
+
+    layout = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
+    n_bytes = serializer.estimate_serialized_size(layout)
+
+    compressed = torch.empty(n_bytes, dtype=torch.uint8, device=device)
+    recovered = torch.empty_like(original)
+
+    written = serializer.serialize(
+        _FakeMemoryObj(original),
+        _FakeMemoryObj(compressed),
+    )
+    assert written == n_bytes
+
+    deserializer.deserialize(
+        _FakeMemoryObj(compressed),
+        _FakeMemoryObj(recovered),
+    )
+
+    orig_f = original.float().flatten()
+    rec_f = recovered.float().flatten()
+
+    corr = torch.corrcoef(torch.stack([orig_f, rec_f]))[0, 1].item()
+    mae = torch.mean(torch.abs(orig_f - rec_f)).item()
+    mse = torch.mean((orig_f - rec_f) ** 2).item()
+
+    original_bytes = original.numel() * original.element_size()
+    ratio = original_bytes / n_bytes
+
+    assert abs(ratio - 2.6122448979591835) < 1e-3
+    assert corr > 0.95, f"low corr: corr={corr}, mae={mae}, mse={mse}"
