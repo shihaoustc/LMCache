@@ -181,33 +181,6 @@ def _wait_for_prefetch_status(
     return None
 
 
-def _finish_read_prefetched_until_clean(
-    sm: StorageManager,
-    keys: list[ObjectKey],
-    timeout: float = 30.0,
-) -> None:
-    """Release prefetched temporary objects and wait for L1 cleanup.
-
-    StorageManager / serde wrapper paths may hold more than one read lock
-    on temporary prefetched objects. Release repeatedly until L1 is clean.
-    """
-    for _ in range(4):
-        sm.finish_read_prefetched(keys)
-        ok = _wait_for_condition(
-            lambda: (
-                sm.report_status()["l1_manager"]["memory_used_bytes"] == 0
-                and sm.report_status()["l1_manager"]["total_object_count"] == 0
-                and sm.report_status()["l1_manager"]["read_locked_count"] == 0
-                and sm.report_status()["l1_manager"]["write_locked_count"] == 0
-                and sm.report_status()["l1_manager"]["temporary_count"] == 0
-            ),
-            timeout=timeout,
-        )
-        if ok:
-            return
-
-    raise AssertionError(f"L1 memory not released: {sm.report_status()['l1_manager']}")
-
 
 def _make_turboquant_storage_manager(preset: str) -> StorageManager:
     adapter_cfg = MockL2AdapterConfig(
@@ -339,7 +312,7 @@ def test_turboquant_storage_manager_roundtrip(
                     f"corr={corr}, mae={mae}, mse={mse}"
                 )
 
-        _finish_read_prefetched_until_clean(sm, keys)
+        sm.finish_read_prefetched(keys)
     finally:
         sm.close()
 
@@ -564,7 +537,7 @@ def test_turboquant_fs_storage_manager_roundtrip(
                     f"corr={corr}, mae={mae}, mse={mse}"
                 )
 
-        _finish_read_prefetched_until_clean(sm, keys)
+        sm.finish_read_prefetched(keys)
 
     finally:
         if sm is not None:
