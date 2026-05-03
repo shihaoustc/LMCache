@@ -55,21 +55,64 @@ def test_create_turboquant_serde_processor() -> None:
     processor.close()
 
 
-def test_k8v4_config_sizes_head_dim_128() -> None:
+@pytest.mark.parametrize(
+    (
+        "preset",
+        "key_fp8",
+        "key_quant_bits",
+        "key_mse_bits",
+        "value_quant_bits",
+        "norm_correction",
+        "key_packed_size",
+        "value_packed_size",
+        "slot_size",
+        "slot_size_aligned",
+    ),
+    [
+        ("turboquant_k8v4", True, 8, 0, 4, False, 128, 68, 196, 196),
+        ("turboquant_4bit_nc", False, 4, 4, 4, True, 66, 68, 134, 134),
+        ("turboquant_k3v4_nc", False, 3, 3, 4, True, 50, 68, 118, 118),
+        ("turboquant_3bit_nc", False, 3, 3, 3, True, 50, 52, 102, 102),
+    ],
+)
+def test_turboquant_config_sizes_head_dim_128(
+    preset: str,
+    key_fp8: bool,
+    key_quant_bits: int,
+    key_mse_bits: int,
+    value_quant_bits: int,
+    norm_correction: bool,
+    key_packed_size: int,
+    value_packed_size: int,
+    slot_size: int,
+    slot_size_aligned: int,
+) -> None:
     cfg = TurboQuantSerdeConfig(
-        preset="turboquant_k8v4",
+        preset=preset,
         head_dim=128,
         block_size=16,
     )
 
-    assert cfg.key_fp8 is True
-    assert cfg.key_quant_bits == 8
-    assert cfg.key_mse_bits == 0
-    assert cfg.value_quant_bits == 4
-    assert cfg.key_packed_size == 128
-    assert cfg.value_packed_size == 68
-    assert cfg.slot_size == 196
-    assert cfg.slot_size_aligned == 196
+    assert cfg.key_fp8 is key_fp8
+    assert cfg.key_quant_bits == key_quant_bits
+    assert cfg.key_mse_bits == key_mse_bits
+    assert cfg.value_quant_bits == value_quant_bits
+    assert cfg.norm_correction is norm_correction
+    assert cfg.key_packed_size == key_packed_size
+    assert cfg.value_packed_size == value_packed_size
+    assert cfg.slot_size == slot_size
+    assert cfg.slot_size_aligned == slot_size_aligned
+
+
+def test_turboquant_config_rejects_invalid_preset() -> None:
+    cfg = TurboQuantSerdeConfig(
+        preset="turboquant_invalid",
+        head_dim=128,
+        block_size=16,
+    )
+
+    with pytest.raises(ValueError, match="Unsupported TurboQuant preset"):
+        _ = cfg.key_quant_bits
 
 
 def test_estimate_serialized_size_k8v4() -> None:
