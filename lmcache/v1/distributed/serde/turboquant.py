@@ -152,6 +152,21 @@ def _make_block_table(num_blocks: int, device: torch.device) -> torch.Tensor:
     return torch.arange(num_blocks, device=device, dtype=torch.int32).view(1, num_blocks)
 
 
+def _select_cuda_device(*tensors: torch.Tensor) -> torch.device:
+    """Select a CUDA device for Triton work.
+
+    If any tensor is already on CUDA, reuse its device. Otherwise use the
+    current CUDA device. This allows StorageManager E2E paths whose L1
+    MemoryObj tensors are CPU / pinned-memory tensors.
+    """
+    for tensor in tensors:
+        if tensor.is_cuda:
+            return tensor.device
+    if not torch.cuda.is_available():
+        raise RuntimeError("TurboQuant Triton serde requires CUDA")
+    return torch.device("cuda", torch.cuda.current_device())
+
+
 def _make_dummy_tq_tensors(
     cfg: TurboQuantSerdeConfig, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -195,11 +210,17 @@ class TurboQuantSerializer(Serializer):
             raise ValueError(
                 f"TurboQuant serialized destination must be torch.uint8, got {dst_tensor.dtype}"
             )
-        if not src_tensor.is_cuda or not dst_tensor.is_cuda:
-            raise RuntimeError(
-                "TurboQuant Triton serializer requires CUDA tensors. "
-                "Use GPU environment to run this path."
-            )
+        cuda_device = _select_cuda_device(src_tensor, dst_tensor)
+
+        # StorageManager may provide CPU / pinned-memory MemoryObjs. Triton
+        # kernels require CUDA tensors, so use temporary CUDA buffers when
+        # necessary and copy the serialized bytes back to the original dst.
+        src_work = src_tensor if src_tensor.is_cuda else src_tensor.to(cuda_device)
+        dst_work = (
+            dst_tensor
+            if dst_tensor.is_cuda
+            else torch.empty(n_bytes, dtype=torch.uint8, device=cuda_device)
+        )
 
         from lmcache.v1.distributed.serde.turboquant_store_kernel import (
             triton_turboquant_store,
@@ -207,21 +228,21 @@ class TurboQuantSerializer(Serializer):
 
         cfg = self._cfg
         num_layers, num_tokens, num_heads, head_dim = _validate_layout_shape(
-            src_tensor.shape, cfg
+            src_work.shape, cfg
         )
-        compressed_shape = _compressed_layout_for_shape(src_tensor.shape, cfg)
-        dst_view = dst_tensor.flatten()[:n_bytes].view(*compressed_shape)
+        compressed_shape = _compressed_layout_for_shape(src_work.shape, cfg)
+        dst_view = dst_work.flatten()[:n_bytes].view(*compressed_shape)
 
-        slot_mapping = _make_slot_mapping(num_tokens, src_tensor.device)
-        pi_t, midpoints, _ = _make_dummy_tq_tensors(cfg, src_tensor.device)
+        slot_mapping = _make_slot_mapping(num_tokens, cuda_device)
+        pi_t, midpoints, _ = _make_dummy_tq_tensors(cfg, cuda_device)
 
         # LMCache layout: [2, L, T, hidden_dim]
         # Kernel input layout per layer: key/value [T, H, D]
         for layer_idx in range(num_layers):
-            key = src_tensor[0, layer_idx].view(
+            key = src_work[0, layer_idx].view(
                 num_tokens, num_heads, head_dim
             ).contiguous()
-            value = src_tensor[1, layer_idx].view(
+            value = src_work[1, layer_idx].view(
                 num_tokens, num_heads, head_dim
             ).contiguous()
             kv_cache_layer = dst_view[layer_idx]
@@ -238,6 +259,9 @@ class TurboQuantSerializer(Serializer):
                 value_quant_bits=cfg.value_quant_bits,
                 key_fp8=cfg.key_fp8,
             )
+
+        if not dst_tensor.is_cuda:
+            dst_tensor.flatten()[:n_bytes].copy_(dst_work.cpu().flatten()[:n_bytes])
 
         return n_bytes
 
@@ -271,11 +295,21 @@ class TurboQuantDeserializer(Deserializer):
             raise ValueError(
                 f"TurboQuant serialized source must be torch.uint8, got {src_tensor.dtype}"
             )
-        if not src_tensor.is_cuda or not dst_tensor.is_cuda:
-            raise RuntimeError(
-                "TurboQuant Triton deserializer requires CUDA tensors. "
-                "Use GPU environment to run this path."
-            )
+        cuda_device = _select_cuda_device(src_tensor, dst_tensor)
+
+        # StorageManager may provide CPU / pinned-memory MemoryObjs. Triton
+        # kernels require CUDA tensors, so copy compressed bytes to CUDA and
+        # dequantize into a CUDA temporary when the destination is CPU.
+        src_work = (
+            src_tensor
+            if src_tensor.is_cuda
+            else src_tensor.flatten()[:n_bytes].to(cuda_device)
+        )
+        dst_work = (
+            dst_tensor
+            if dst_tensor.is_cuda
+            else torch.empty(dst_tensor.shape, dtype=dst_tensor.dtype, device=cuda_device)
+        )
 
         from lmcache.v1.distributed.serde.turboquant_decode_kernel import (
             _tq_full_dequant_kv,
@@ -284,15 +318,15 @@ class TurboQuantDeserializer(Deserializer):
 
         cfg = self._cfg
         num_layers, num_tokens, num_heads, head_dim = _validate_layout_shape(
-            dst_tensor.shape, cfg
+            dst_work.shape, cfg
         )
-        compressed_shape = _compressed_layout_for_shape(dst_tensor.shape, cfg)
-        src_view = src_tensor.flatten()[:n_bytes].view(*compressed_shape)
+        compressed_shape = _compressed_layout_for_shape(dst_work.shape, cfg)
+        src_view = src_work.flatten()[:n_bytes].view(*compressed_shape)
 
         num_blocks = compressed_shape[1]
         alloc_len = num_blocks * cfg.block_size
-        block_table = _make_block_table(num_blocks, dst_tensor.device)
-        _, _, centroids = _make_dummy_tq_tensors(cfg, dst_tensor.device)
+        block_table = _make_block_table(num_blocks, cuda_device)
+        _, _, centroids = _make_dummy_tq_tensors(cfg, cuda_device)
 
         block_d = 1 << (head_dim - 1).bit_length()
         val_data_bytes = math.ceil(head_dim * cfg.value_quant_bits / 8)
@@ -308,12 +342,12 @@ class TurboQuantDeserializer(Deserializer):
             k_out = torch.empty(
                 (1, num_heads, alloc_len, head_dim),
                 dtype=torch.float16,
-                device=dst_tensor.device,
+                device=cuda_device,
             )
             v_out = torch.empty(
                 (1, num_heads, alloc_len, head_dim),
                 dtype=torch.float16,
-                device=dst_tensor.device,
+                device=cuda_device,
             )
 
             grid = (alloc_len, num_heads)
@@ -344,7 +378,7 @@ class TurboQuantDeserializer(Deserializer):
                 KEY_FP8=1 if cfg.key_fp8 else 0,
                 BLOCK_D=block_d,
                 NORM_CORRECTION=0,
-                FP8_E4B15=_use_fp8_e4b15(dst_tensor.device.index or 0),
+                FP8_E4B15=_use_fp8_e4b15(cuda_device.index or 0),
                 num_warps=4,
             )
 
@@ -361,8 +395,11 @@ class TurboQuantDeserializer(Deserializer):
                 .view(num_tokens, num_heads * head_dim)
             )
 
-            dst_tensor[0, layer_idx].copy_(key.to(dst_tensor.dtype))
-            dst_tensor[1, layer_idx].copy_(value.to(dst_tensor.dtype))
+            dst_work[0, layer_idx].copy_(key.to(dst_work.dtype))
+            dst_work[1, layer_idx].copy_(value.to(dst_work.dtype))
+
+        if not dst_tensor.is_cuda:
+            dst_tensor.copy_(dst_work.cpu())
 
 
 def _create_turboquant_serde(kwargs: dict[str, object]) -> SerdeProcessor:
