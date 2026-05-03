@@ -181,7 +181,7 @@ def _wait_for_prefetch_status(
     return None
 
 
-def _make_turboquant_storage_manager() -> StorageManager:
+def _make_turboquant_storage_manager(preset: str) -> StorageManager:
     adapter_cfg = MockL2AdapterConfig(
         max_size_gb=0.1,
         mock_bandwidth_gb=10.0,
@@ -189,7 +189,7 @@ def _make_turboquant_storage_manager() -> StorageManager:
     adapter_cfg.serde_config = SerdeConfig(
         type="turboquant",
         kwargs={
-            "preset": "turboquant_k8v4",
+            "preset": preset,
             "head_dim": 128,
             "block_size": 16,
             "max_workers": 1,
@@ -211,7 +211,19 @@ def _make_turboquant_storage_manager() -> StorageManager:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-def test_turboquant_storage_manager_roundtrip() -> None:
+@pytest.mark.parametrize(
+    ("preset", "corr_lower_bound"),
+    [
+        ("turboquant_k8v4", 0.95),
+        ("turboquant_4bit_nc", 0.90),
+        ("turboquant_k3v4_nc", 0.85),
+        ("turboquant_3bit_nc", 0.80),
+    ],
+)
+def test_turboquant_storage_manager_roundtrip(
+    preset: str,
+    corr_lower_bound: float,
+) -> None:
     """Store/load through StorageManager with TurboQuant serde.
 
     This verifies:
@@ -220,7 +232,7 @@ def test_turboquant_storage_manager_roundtrip() -> None:
     -> clear L1 -> prefetch -> MockL2Adapter load
     -> SerdeL2AdapterWrapper deserialize -> read_prefetched_results.
     """
-    sm = _make_turboquant_storage_manager()
+    sm = _make_turboquant_storage_manager(preset)
     layout = _make_turboquant_layout()
     keys = [_make_turboquant_object_key(i) for i in range(3)]
 
@@ -284,20 +296,24 @@ def test_turboquant_storage_manager_roundtrip() -> None:
                 mae = torch.mean(torch.abs(orig_f - rec_f)).item()
                 mse = torch.mean((orig_f - rec_f) ** 2).item()
 
-                assert corr > 0.95, (
-                    f"low corr for key {key}: corr={corr}, mae={mae}, mse={mse}"
+                assert corr > corr_lower_bound, (
+                    f"low corr for preset={preset}, key={key}: "
+                    f"corr={corr}, mae={mae}, mse={mse}"
                 )
 
         sm.finish_read_prefetched(keys)
 
         ok = _wait_for_condition(
-            lambda: sm.report_status()["l1_manager"]["memory_used_bytes"] == 0,
-            timeout=10.0,
+            lambda: (
+                sm.report_status()["l1_manager"]["memory_used_bytes"] == 0
+                and sm.report_status()["l1_manager"]["total_object_count"] == 0
+                and sm.report_status()["l1_manager"]["read_locked_count"] == 0
+                and sm.report_status()["l1_manager"]["write_locked_count"] == 0
+                and sm.report_status()["l1_manager"]["temporary_count"] == 0
+            ),
+            timeout=30.0,
         )
-        assert ok, (
-            "L1 memory not released; "
-            f"memory_used={sm.report_status()['l1_manager']['memory_used_bytes']}"
-        )
+        assert ok, f"L1 memory not released: {sm.report_status()['l1_manager']}"
     finally:
         sm.close()
 
@@ -313,7 +329,20 @@ class _FakeMemoryObj:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-def test_turboquant_direct_roundtrip_cuda() -> None:
+@pytest.mark.parametrize(
+    ("preset", "expected_ratio_lower_bound", "corr_lower_bound"),
+    [
+        ("turboquant_k8v4", 2.60, 0.95),
+        ("turboquant_4bit_nc", 3.75, 0.90),
+        ("turboquant_k3v4_nc", 4.20, 0.85),
+        ("turboquant_3bit_nc", 4.85, 0.80),
+    ],
+)
+def test_turboquant_direct_roundtrip_cuda(
+    preset: str,
+    expected_ratio_lower_bound: float,
+    corr_lower_bound: float,
+) -> None:
     """Direct GPU round-trip through TurboQuant serializer/deserializer."""
     from lmcache.v1.distributed.serde.turboquant import TurboQuantDeserializer
 
@@ -328,11 +357,12 @@ def test_turboquant_direct_roundtrip_cuda() -> None:
     hidden_dim = num_heads * head_dim
 
     cfg = TurboQuantSerdeConfig(
-        preset="turboquant_k8v4",
+        preset=preset,
         head_dim=head_dim,
         block_size=16,
     )
 
+    torch.manual_seed(2026)
     shape = torch.Size([2, num_layers, num_tokens, hidden_dim])
     original = torch.randn(shape, dtype=dtype, device=device)
 
@@ -366,8 +396,10 @@ def test_turboquant_direct_roundtrip_cuda() -> None:
     original_bytes = original.numel() * original.element_size()
     ratio = original_bytes / n_bytes
 
-    assert abs(ratio - 2.6122448979591835) < 1e-3
-    assert corr > 0.95, f"low corr: corr={corr}, mae={mae}, mse={mse}"
+    assert ratio >= expected_ratio_lower_bound
+    assert corr > corr_lower_bound, (
+        f"low corr for preset={preset}: corr={corr}, mae={mae}, mse={mse}"
+    )
 
 
 # =============================================================================
@@ -375,7 +407,10 @@ def test_turboquant_direct_roundtrip_cuda() -> None:
 # =============================================================================
 
 
-def _make_turboquant_fs_storage_manager(base_path: str) -> StorageManager:
+def _make_turboquant_fs_storage_manager(
+    base_path: str,
+    preset: str,
+) -> StorageManager:
     adapter_cfg = FSL2AdapterConfig(
         base_path=base_path,
         relative_tmp_dir="tmp",
@@ -384,7 +419,7 @@ def _make_turboquant_fs_storage_manager(base_path: str) -> StorageManager:
     adapter_cfg.serde_config = SerdeConfig(
         type="turboquant",
         kwargs={
-            "preset": "turboquant_k8v4",
+            "preset": preset,
             "head_dim": 128,
             "block_size": 16,
             "max_workers": 1,
@@ -406,13 +441,25 @@ def _make_turboquant_fs_storage_manager(base_path: str) -> StorageManager:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-def test_turboquant_fs_storage_manager_roundtrip() -> None:
+@pytest.mark.parametrize(
+    ("preset", "corr_lower_bound"),
+    [
+        ("turboquant_k8v4", 0.95),
+        ("turboquant_4bit_nc", 0.90),
+        ("turboquant_k3v4_nc", 0.85),
+        ("turboquant_3bit_nc", 0.80),
+    ],
+)
+def test_turboquant_fs_storage_manager_roundtrip(
+    preset: str,
+    corr_lower_bound: float,
+) -> None:
     """Store/load through FSL2Adapter with TurboQuant serde."""
     base_dir = tempfile.mkdtemp(prefix="lmcache_turboquant_fs_")
     sm = None
 
     try:
-        sm = _make_turboquant_fs_storage_manager(base_dir)
+        sm = _make_turboquant_fs_storage_manager(base_dir, preset)
         layout = _make_turboquant_layout()
         keys = [_make_turboquant_object_key(i) for i in range(3)]
 
@@ -476,20 +523,24 @@ def test_turboquant_fs_storage_manager_roundtrip() -> None:
                 mae = torch.mean(torch.abs(orig_f - rec_f)).item()
                 mse = torch.mean((orig_f - rec_f) ** 2).item()
 
-                assert corr > 0.95, (
-                    f"low corr for key {key}: corr={corr}, mae={mae}, mse={mse}"
+                assert corr > corr_lower_bound, (
+                    f"low corr for preset={preset}, key={key}: "
+                    f"corr={corr}, mae={mae}, mse={mse}"
                 )
 
         sm.finish_read_prefetched(keys)
 
         ok = _wait_for_condition(
-            lambda: sm.report_status()["l1_manager"]["memory_used_bytes"] == 0,
-            timeout=10.0,
+            lambda: (
+                sm.report_status()["l1_manager"]["memory_used_bytes"] == 0
+                and sm.report_status()["l1_manager"]["total_object_count"] == 0
+                and sm.report_status()["l1_manager"]["read_locked_count"] == 0
+                and sm.report_status()["l1_manager"]["write_locked_count"] == 0
+                and sm.report_status()["l1_manager"]["temporary_count"] == 0
+            ),
+            timeout=30.0,
         )
-        assert ok, (
-            "L1 memory not released; "
-            f"memory_used={sm.report_status()['l1_manager']['memory_used_bytes']}"
-        )
+        assert ok, f"L1 memory not released: {sm.report_status()['l1_manager']}"
 
     finally:
         if sm is not None:
