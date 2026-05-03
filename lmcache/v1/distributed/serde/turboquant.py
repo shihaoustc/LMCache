@@ -308,7 +308,11 @@ class TurboQuantDeserializer(Deserializer):
         dst_work = (
             dst_tensor
             if dst_tensor.is_cuda
-            else torch.empty(dst_tensor.shape, dtype=dst_tensor.dtype, device=cuda_device)
+            else torch.empty(
+                dst_tensor.shape,
+                dtype=dst_tensor.dtype,
+                device=cuda_device,
+            )
         )
 
         from lmcache.v1.distributed.serde.turboquant_decode_kernel import (
