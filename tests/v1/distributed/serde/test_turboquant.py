@@ -4,7 +4,10 @@ Unit tests for TurboQuant serde skeleton.
 """
 
 # Standard
+import shutil
+import tempfile
 import time
+from pathlib import Path
 
 # Third Party
 import pytest
@@ -19,6 +22,7 @@ from lmcache.v1.distributed.config import (
     StorageManagerConfig,
 )
 from lmcache.v1.distributed.l2_adapters.config import L2AdaptersConfig
+from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import FSL2AdapterConfig
 from lmcache.v1.distributed.l2_adapters.mock_l2_adapter import MockL2AdapterConfig
 from lmcache.v1.distributed.serde import (
     SerdeConfig,
@@ -364,3 +368,130 @@ def test_turboquant_direct_roundtrip_cuda() -> None:
 
     assert abs(ratio - 2.6122448979591835) < 1e-3
     assert corr > 0.95, f"low corr: corr={corr}, mae={mae}, mse={mse}"
+
+
+# =============================================================================
+# GPU E2E test: StorageManager + SerdeL2AdapterWrapper + FSL2Adapter
+# =============================================================================
+
+
+def _make_turboquant_fs_storage_manager(base_path: str) -> StorageManager:
+    adapter_cfg = FSL2AdapterConfig(
+        base_path=base_path,
+        relative_tmp_dir="tmp",
+        use_odirect=False,
+    )
+    adapter_cfg.serde_config = SerdeConfig(
+        type="turboquant",
+        kwargs={
+            "preset": "turboquant_k8v4",
+            "head_dim": 128,
+            "block_size": 16,
+            "max_workers": 1,
+        },
+    )
+
+    cfg = StorageManagerConfig(
+        l1_manager_config=L1ManagerConfig(
+            memory_config=L1MemoryManagerConfig(
+                size_in_bytes=256 * 1024 * 1024,
+                use_lazy=torch.cuda.is_available(),
+                init_size_in_bytes=64 * 1024 * 1024,
+            ),
+        ),
+        eviction_config=EvictionConfig(eviction_policy="LRU"),
+        l2_adapter_config=L2AdaptersConfig(adapters=[adapter_cfg]),
+    )
+    return StorageManager(cfg)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_turboquant_fs_storage_manager_roundtrip() -> None:
+    """Store/load through FSL2Adapter with TurboQuant serde."""
+    base_dir = tempfile.mkdtemp(prefix="lmcache_turboquant_fs_")
+    sm = None
+
+    try:
+        sm = _make_turboquant_fs_storage_manager(base_dir)
+        layout = _make_turboquant_layout()
+        keys = [_make_turboquant_object_key(i) for i in range(3)]
+
+        ret = sm.reserve_write(keys, layout, mode="new")
+        assert len(ret) == len(keys), f"reserve_write got {len(ret)} / {len(keys)}"
+
+        original_by_key = {}
+        for i, key in enumerate(keys):
+            obj = ret[key]
+            assert obj.tensor is not None
+
+            torch.manual_seed(5678 + i)
+            data = torch.randn(
+                obj.tensor.shape,
+                dtype=obj.tensor.dtype,
+                device=obj.tensor.device,
+            )
+            data = data + float(i)
+
+            obj.tensor.copy_(data)
+            original_by_key[key] = data.detach().clone()
+
+        sm.finish_write(list(ret.keys()))
+
+        ok = _wait_for_condition(
+            lambda: (
+                sm.report_status()["store_controller"]["in_flight_task_count"] == 0
+                and sm.report_status()["store_controller"]["pending_keys_count"] == 0
+                and sm.report_status()["l1_manager"]["write_locked_count"] == 0
+                and sm.report_status()["l1_manager"]["read_locked_count"] == 0
+                and sm.report_status()["l1_manager"]["temporary_count"] == 0
+            ),
+            timeout=30.0,
+        )
+        assert ok, "Store to FS L2 did not fully complete"
+
+        stored_files = [p for p in Path(base_dir).rglob("*") if p.is_file()]
+        assert len(stored_files) >= len(keys)
+
+        sm.clear()
+        assert sm.report_status()["l1_manager"]["total_object_count"] == 0
+
+        handle = sm.submit_prefetch_task(keys, layout)
+        hits = _wait_for_prefetch_status(sm, handle, timeout=30.0)
+        assert hits == len(keys), f"Expected {len(keys)} hits, got {hits}"
+
+        with sm.read_prefetched_results(keys) as objs:
+            assert objs is not None
+            assert len(objs) == len(keys)
+
+            for key, obj in zip(keys, objs, strict=True):
+                assert obj.tensor is not None
+
+                recovered = obj.tensor
+                original = original_by_key[key]
+
+                orig_f = original.float().flatten()
+                rec_f = recovered.float().flatten()
+
+                corr = torch.corrcoef(torch.stack([orig_f, rec_f]))[0, 1].item()
+                mae = torch.mean(torch.abs(orig_f - rec_f)).item()
+                mse = torch.mean((orig_f - rec_f) ** 2).item()
+
+                assert corr > 0.95, (
+                    f"low corr for key {key}: corr={corr}, mae={mae}, mse={mse}"
+                )
+
+        sm.finish_read_prefetched(keys)
+
+        ok = _wait_for_condition(
+            lambda: sm.report_status()["l1_manager"]["memory_used_bytes"] == 0,
+            timeout=10.0,
+        )
+        assert ok, (
+            "L1 memory not released; "
+            f"memory_used={sm.report_status()['l1_manager']['memory_used_bytes']}"
+        )
+
+    finally:
+        if sm is not None:
+            sm.close()
+        shutil.rmtree(base_dir, ignore_errors=True)
