@@ -3,12 +3,23 @@
 Unit tests for TurboQuant serde skeleton.
 """
 
+# Standard
+import time
+
 # Third Party
 import pytest
 import torch
 
 # First Party
-from lmcache.v1.distributed.api import MemoryLayoutDesc
+from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
+from lmcache.v1.distributed.config import (
+    EvictionConfig,
+    L1ManagerConfig,
+    L1MemoryManagerConfig,
+    StorageManagerConfig,
+)
+from lmcache.v1.distributed.l2_adapters.config import L2AdaptersConfig
+from lmcache.v1.distributed.l2_adapters.mock_l2_adapter import MockL2AdapterConfig
 from lmcache.v1.distributed.serde import (
     SerdeConfig,
     create_serde_processor,
@@ -18,6 +29,7 @@ from lmcache.v1.distributed.serde.turboquant import (
     TurboQuantSerdeConfig,
     TurboQuantSerializer,
 )
+from lmcache.v1.distributed.storage_manager import StorageManager
 
 
 def test_turboquant_registered() -> None:
@@ -113,4 +125,174 @@ def test_estimate_serialized_size_rejects_bad_head_dim() -> None:
 
     with pytest.raises(ValueError, match="must be divisible"):
         serializer.estimate_serialized_size(layout)
-        
+
+
+# =============================================================================
+# GPU E2E test: StorageManager + SerdeL2AdapterWrapper + MockL2Adapter
+# =============================================================================
+
+
+def _make_turboquant_object_key(chunk_id: int) -> ObjectKey:
+    return ObjectKey(
+        chunk_hash=ObjectKey.IntHash2Bytes(chunk_id),
+        model_name="turboquant_test_model",
+        kv_rank=0,
+    )
+
+
+def _make_turboquant_layout() -> MemoryLayoutDesc:
+    # TurboQuant serde currently expects [2, num_layers, num_tokens, hidden_dim].
+    # hidden_dim = num_heads * head_dim = 4 * 128 = 512.
+    return MemoryLayoutDesc(
+        shapes=[torch.Size([2, 2, 32, 512])],
+        dtypes=[torch.bfloat16],
+    )
+
+
+def _wait_for_condition(
+    predicate,
+    timeout: float = 20.0,
+    poll_interval: float = 0.05,
+) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(poll_interval)
+    return False
+
+
+def _wait_for_prefetch_status(
+    sm: StorageManager,
+    handle,
+    timeout: float = 20.0,
+    poll_interval: float = 0.05,
+) -> int | None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = sm.query_prefetch_status(handle)
+        if result is not None:
+            return result
+        time.sleep(poll_interval)
+    return None
+
+
+def _make_turboquant_storage_manager() -> StorageManager:
+    adapter_cfg = MockL2AdapterConfig(
+        max_size_gb=0.1,
+        mock_bandwidth_gb=10.0,
+    )
+    adapter_cfg.serde_config = SerdeConfig(
+        type="turboquant",
+        kwargs={
+            "preset": "turboquant_k8v4",
+            "head_dim": 128,
+            "block_size": 16,
+            "max_workers": 1,
+        },
+    )
+
+    cfg = StorageManagerConfig(
+        l1_manager_config=L1ManagerConfig(
+            memory_config=L1MemoryManagerConfig(
+                size_in_bytes=256 * 1024 * 1024,
+                use_lazy=torch.cuda.is_available(),
+                init_size_in_bytes=64 * 1024 * 1024,
+            ),
+        ),
+        eviction_config=EvictionConfig(eviction_policy="LRU"),
+        l2_adapter_config=L2AdaptersConfig(adapters=[adapter_cfg]),
+    )
+    return StorageManager(cfg)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_turboquant_storage_manager_roundtrip() -> None:
+    """Store/load through StorageManager with TurboQuant serde.
+
+    This verifies:
+    reserve_write -> finish_write -> StoreController
+    -> SerdeL2AdapterWrapper serialize -> MockL2Adapter store
+    -> clear L1 -> prefetch -> MockL2Adapter load
+    -> SerdeL2AdapterWrapper deserialize -> read_prefetched_results.
+    """
+    sm = _make_turboquant_storage_manager()
+    layout = _make_turboquant_layout()
+    keys = [_make_turboquant_object_key(i) for i in range(3)]
+
+    try:
+        ret = sm.reserve_write(keys, layout, mode="new")
+        assert len(ret) == len(keys), f"reserve_write got {len(ret)} / {len(keys)}"
+
+        original_by_key = {}
+        for i, key in enumerate(keys):
+            obj = ret[key]
+            assert obj.tensor is not None
+
+            torch.manual_seed(1234 + i)
+            data = torch.randn(
+                obj.tensor.shape,
+                dtype=obj.tensor.dtype,
+                device=obj.tensor.device,
+            )
+            data = data + float(i)
+
+            obj.tensor.copy_(data)
+            original_by_key[key] = data.detach().clone()
+
+        sm.finish_write(list(ret.keys()))
+
+        # Wait until both the store controller and the serde wrapper cleanup
+        # have released temporary objects and locks.
+        ok = _wait_for_condition(
+            lambda: (
+                sm.report_status()["store_controller"]["in_flight_task_count"] == 0
+                and sm.report_status()["store_controller"]["pending_keys_count"] == 0
+                and sm.report_status()["l1_manager"]["write_locked_count"] == 0
+                and sm.report_status()["l1_manager"]["read_locked_count"] == 0
+                and sm.report_status()["l1_manager"]["temporary_count"] == 0
+            ),
+            timeout=30.0,
+        )
+        assert ok, "Store to L2 did not fully complete"
+
+        sm.clear()
+        assert sm.report_status()["l1_manager"]["total_object_count"] == 0
+
+        handle = sm.submit_prefetch_task(keys, layout)
+        hits = _wait_for_prefetch_status(sm, handle, timeout=30.0)
+        assert hits == len(keys), f"Expected {len(keys)} hits, got {hits}"
+
+        with sm.read_prefetched_results(keys) as objs:
+            assert objs is not None
+            assert len(objs) == len(keys)
+
+            for key, obj in zip(keys, objs, strict=True):
+                assert obj.tensor is not None
+
+                recovered = obj.tensor
+                original = original_by_key[key]
+
+                orig_f = original.float().flatten()
+                rec_f = recovered.float().flatten()
+
+                corr = torch.corrcoef(torch.stack([orig_f, rec_f]))[0, 1].item()
+                mae = torch.mean(torch.abs(orig_f - rec_f)).item()
+                mse = torch.mean((orig_f - rec_f) ** 2).item()
+
+                assert corr > 0.95, (
+                    f"low corr for key {key}: corr={corr}, mae={mae}, mse={mse}"
+                )
+
+        sm.finish_read_prefetched(keys)
+
+        ok = _wait_for_condition(
+            lambda: sm.report_status()["l1_manager"]["memory_used_bytes"] == 0,
+            timeout=10.0,
+        )
+        assert ok, (
+            "L1 memory not released; "
+            f"memory_used={sm.report_status()['l1_manager']['memory_used_bytes']}"
+        )
+    finally:
+        sm.close()
