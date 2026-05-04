@@ -115,9 +115,12 @@ LMCACHE_PID=$!
 echo "lmcache server PID=$LMCACHE_PID"
 
 echo "Waiting for lmcache HTTP health..."
-wait_for_url "http://localhost:${LMCACHE_HTTP_PORT}/api/healthcheck" 60 || {
-    echo "lmcache failed to start. Last 50 lines of log:"
-    tail -50 "$TMP_DIR/lmcache.log" || true
+wait_for_url "http://localhost:${LMCACHE_HTTP_PORT}/api/healthcheck" 180 || {
+    echo "lmcache failed to start. Status response:"
+    curl -s "http://localhost:${LMCACHE_HTTP_PORT}/api/status" || true
+    echo ""
+    echo "Last 80 lines of lmcache log:"
+    tail -80 "$TMP_DIR/lmcache.log" || true
     exit 1
 }
 echo "lmcache server ready."
@@ -133,9 +136,10 @@ echo "Model: $MODEL"
 
 KV_TRANSFER_CONFIG=$(cat <<EOF
 {
-  "kv_connector": "LMCacheMPConnector",
+  "kv_connector": "LMCacheMPConnectorDirect",
   "kv_role": "kv_both",
   "kv_load_failure_policy": "recompute",
+  "kv_connector_module_path": "lmcache.integration.vllm.lmcache_mp_connector_0180",
   "kv_connector_extra_config": {
     "lmcache.mp.port": ${LMCACHE_PORT},
     "lmcache.mp.mq_timeout": 10

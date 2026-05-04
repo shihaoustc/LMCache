@@ -28,6 +28,7 @@ try:
         LMCacheMPSchedulerAdapter,
         LMCacheMPWorkerAdapter,
         LoadStoreOp,
+        ParallelStrategy,
     )
 except ImportError:
     from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_integration import (
@@ -117,24 +118,25 @@ def create_scheduler_adapter(
         vllm_config.parallel_config.rank,
         vllm_config,
     )
-    tp_size = vllm_config.parallel_config.tensor_parallel_size
 
-    # Pass tp_size only when the adapter accepts it so that
-    # a newer vllm can still work with an older LMCache.
-    kwargs: dict[str, Any] = {}
-    if _adapter_accepts_tp_size():
-        kwargs["tp_size"] = tp_size
+    parallel_strategy = ParallelStrategy(
+        use_mla=mla_enabled(vllm_config.model_config),
+        kv_world_size=world_size,
+        kv_worker_id=kv_rank,
+        actual_world_size=vllm_config.parallel_config.world_size,
+        actual_worker_id=vllm_config.parallel_config.rank,
+        tp_size=vllm_config.parallel_config.tensor_parallel_size,
+        pp_size=vllm_config.parallel_config.pipeline_parallel_size,
+    )
 
     return LMCacheMPSchedulerAdapter(
         server_url,
         zmq_context,
         vllm_config.model_config.model,
-        world_size,
-        kv_rank,
         vllm_config.cache_config.block_size,
+        parallel_strategy,
         mq_timeout=mq_timeout,
         heartbeat_interval=heartbeat_interval,
-        **kwargs,
     )
 
 
@@ -150,13 +152,23 @@ def create_worker_adapter(
         vllm_config.parallel_config.rank,
         vllm_config,
     )
+
+    parallel_strategy = ParallelStrategy(
+        use_mla=mla_enabled(vllm_config.model_config),
+        kv_world_size=world_size,
+        kv_worker_id=kv_rank,
+        actual_world_size=vllm_config.parallel_config.world_size,
+        actual_worker_id=vllm_config.parallel_config.rank,
+        tp_size=vllm_config.parallel_config.tensor_parallel_size,
+        pp_size=vllm_config.parallel_config.pipeline_parallel_size,
+    )
+
     return LMCacheMPWorkerAdapter(
         server_url,
         zmq_context,
         vllm_config.model_config.model,
-        world_size,
-        kv_rank,
         vllm_config.cache_config.block_size,
+        parallel_strategy,
         mq_timeout=mq_timeout,
         heartbeat_interval=heartbeat_interval,
     )
@@ -1070,3 +1082,7 @@ class LMCacheMPConnector(KVConnectorBase_V1):
                 "[KVConnector] Cleaned up request_tracker for request %s",
                 request_id,
             )
+
+
+# Alias used to force vLLM to load this module via kv_connector_module_path.
+LMCacheMPConnectorDirect = LMCacheMPConnector
