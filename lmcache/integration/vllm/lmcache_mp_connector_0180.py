@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from __future__ import annotations
 import enum
 import inspect
 from collections.abc import Iterable
@@ -17,7 +18,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorRole,
 )
-from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
@@ -37,6 +37,11 @@ except ImportError:
     )
 
 if TYPE_CHECKING:
+    try:
+        from vllm.v1.attention.backend import AttentionMetadata
+    except ModuleNotFoundError:
+        from vllm.v1.attention.backends.flash_attn import AttentionMetadata
+
     from vllm.distributed.kv_events import KVCacheEvent
     from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
         KVConnectorPromMetrics,
