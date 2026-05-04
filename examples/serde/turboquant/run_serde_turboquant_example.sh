@@ -40,6 +40,7 @@ VLLM_PORT="${VLLM_PORT:-8000}"
 L1_SIZE_GB="${L1_SIZE_GB:-20}"              # CPU cache size
 
 TMP_DIR="${TMP_DIR:-/tmp/lmcache_turboquant_serde_example}"
+KEEP_ALIVE="${KEEP_ALIVE:-0}"
 L2_DISK_PATH="${L2_DISK_PATH:-${TMP_DIR}/disk}"
 mkdir -p "$TMP_DIR"
 mkdir -p "$L2_DISK_PATH"
@@ -71,12 +72,28 @@ EOF
 LMCACHE_PID=""
 VLLM_PID=""
 cleanup() {
+    if [ "${KEEP_ALIVE}" = "1" ]; then
+        echo "--- KEEP_ALIVE=1: leaving servers running ---"
+        echo "LMCache PID: ${LMCACHE_PID}"
+        echo "vLLM PID: ${VLLM_PID}"
+        return
+    fi
+
     echo "--- Cleaning up ---"
     [ -n "$VLLM_PID" ] && kill "$VLLM_PID" 2>/dev/null || true
     [ -n "$LMCACHE_PID" ] && kill "$LMCACHE_PID" 2>/dev/null || true
     wait 2>/dev/null || true
 }
+
+force_cleanup() {
+    echo "--- Cleaning up ---"
+    [ -n "$VLLM_PID" ] && kill "$VLLM_PID" 2>/dev/null || true
+    [ -n "$LMCACHE_PID" ] && kill "$LMCACHE_PID" 2>/dev/null || true
+    wait 2>/dev/null || true
+}
+
 trap cleanup EXIT
+trap force_cleanup INT TERM
 
 wait_for_url() {
     local url="$1"
@@ -251,3 +268,11 @@ echo ""
 echo "============================================"
 echo "Done. Logs are under: $TMP_DIR"
 echo "============================================"
+
+if [ "${KEEP_ALIVE}" = "1" ]; then
+    echo "KEEP_ALIVE=1: servers are still running."
+    echo "Run the benchmark in another shell, or press Ctrl+C here to stop servers."
+    while true; do
+        sleep 3600
+    done
+fi
