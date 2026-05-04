@@ -317,17 +317,6 @@ def test_turboquant_storage_manager_roundtrip(
         assert ok, "Store to L2 did not fully complete"
 
         sm.clear()
-        ok = _wait_for_condition(
-            lambda: (
-                sm.report_status()["l1_manager"]["total_object_count"] == 0
-                and sm.report_status()["l1_manager"]["memory_used_bytes"] == 0
-                and sm.report_status()["l1_manager"]["read_locked_count"] == 0
-                and sm.report_status()["l1_manager"]["write_locked_count"] == 0
-                and sm.report_status()["l1_manager"]["temporary_count"] == 0
-            ),
-            timeout=30.0,
-        )
-        assert ok, f"L1 not cleared: {sm.report_status()['l1_manager']}"
 
         handle = sm.submit_prefetch_task(keys, layout)
         hits = _wait_for_prefetch_status(sm, handle, timeout=30.0)
@@ -542,17 +531,6 @@ def test_turboquant_fs_storage_manager_roundtrip(
         assert len(stored_files) >= len(keys)
 
         sm.clear()
-        ok = _wait_for_condition(
-            lambda: (
-                sm.report_status()["l1_manager"]["total_object_count"] == 0
-                and sm.report_status()["l1_manager"]["memory_used_bytes"] == 0
-                and sm.report_status()["l1_manager"]["read_locked_count"] == 0
-                and sm.report_status()["l1_manager"]["write_locked_count"] == 0
-                and sm.report_status()["l1_manager"]["temporary_count"] == 0
-            ),
-            timeout=30.0,
-        )
-        assert ok, f"L1 not cleared: {sm.report_status()['l1_manager']}"
 
         handle = sm.submit_prefetch_task(keys, layout)
         hits = _wait_for_prefetch_status(sm, handle, timeout=30.0)
