@@ -45,13 +45,17 @@ L2_DISK_PATH="${L2_DISK_PATH:-${TMP_DIR}/disk}"
 mkdir -p "$TMP_DIR"
 mkdir -p "$L2_DISK_PATH"
 
-# L2 adapter JSON: disk (fs) backend with TurboQuant serde enabled.
-# Default preset is the safest first serving validation path. Override with:
-#   TQ_PRESET=turboquant_4bit_nc ./run_serde_turboquant_example.sh
+# L2 adapter JSON: disk (fs) backend with configurable serde.
+# Supported:
+#   SERDE_TYPE=turboquant TQ_PRESET=turboquant_4bit_nc ./run_serde_turboquant_example.sh
+#   SERDE_TYPE=fp8 FP8_DTYPE=float8_e4m3fn ./run_serde_turboquant_example.sh
+SERDE_TYPE="${SERDE_TYPE:-turboquant}"
 TQ_PRESET="${TQ_PRESET:-turboquant_k8v4}"
 TQ_HEAD_DIM="${TQ_HEAD_DIM:-128}"
 TQ_BLOCK_SIZE="${TQ_BLOCK_SIZE:-16}"
+FP8_DTYPE="${FP8_DTYPE:-float8_e4m3fn}"
 
+if [ "${SERDE_TYPE}" = "turboquant" ]; then
 L2_ADAPTER_JSON=$(cat <<EOF
 {
   "type": "fs",
@@ -65,6 +69,22 @@ L2_ADAPTER_JSON=$(cat <<EOF
 }
 EOF
 )
+elif [ "${SERDE_TYPE}" = "fp8" ]; then
+L2_ADAPTER_JSON=$(cat <<EOF
+{
+  "type": "fs",
+  "base_path": "${L2_DISK_PATH}",
+  "serde": {
+    "type": "fp8",
+    "fp8_dtype": "${FP8_DTYPE}"
+  }
+}
+EOF
+)
+else
+    echo "Unsupported SERDE_TYPE=${SERDE_TYPE}. Expected: turboquant or fp8."
+    exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # Cleanup helpers
@@ -117,7 +137,11 @@ echo "=== Step 1: Starting LMCache MP server ==="
 echo "============================================"
 echo "L1 (CPU): ${L1_SIZE_GB} GB"
 echo "L2 (disk): ${L2_DISK_PATH}"
-echo "Serde: turboquant (${TQ_PRESET})"
+if [ "${SERDE_TYPE}" = "turboquant" ]; then
+    echo "Serde: turboquant (${TQ_PRESET})"
+else
+    echo "Serde: fp8 (${FP8_DTYPE})"
+fi
 
 lmcache server \
     --l1-size-gb "$L1_SIZE_GB" \
